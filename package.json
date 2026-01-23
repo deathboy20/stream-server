@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "ts-node src/server.ts",
+    "start": "node dist/server.js",
     "dev": "nodemon src/server.ts",
     "build": "tsc"
   },
@@ -19,6 +19,7 @@
     "firebase": "^12.8.0",
     "firebase-admin": "^13.6.0",
     "node-cron": "^4.2.1",
+    "socket.io": "^4.7.4",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
