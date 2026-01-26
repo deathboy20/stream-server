@@ -7,7 +7,8 @@ import {
   requestJoin,
   approveViewer,
   rejectViewer,
-  removeViewer
+  removeViewer,
+  updateAdmissionMode
 } from '../controllers/sessionController';
 
 const router = Router();
@@ -19,6 +20,7 @@ router.get('/:id/viewers', getViewers);
 router.post('/:id/request', requestJoin);
 router.post('/:id/approve', approveViewer);
 router.post('/:id/reject', rejectViewer);
+router.post('/:id/admission', updateAdmissionMode);
 router.delete('/:id/viewers/:viewerId', removeViewer);
 
 export default router;

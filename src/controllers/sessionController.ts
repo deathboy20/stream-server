@@ -16,7 +16,8 @@ export const createSession = async (req: Request, res: Response) => {
       createdAt: now,
       isActive: true,
       viewers: {}, // This will be handled as a subcollection or map depending on structure, but for simplicity keeping as empty obj here
-      expiresAt: now + 24 * 60 * 60 * 1000 // 24 hours
+      expiresAt: now + 24 * 60 * 60 * 1000, // 24 hours
+      admissionMode: 'manual'
     };
 
     const sessionRef = doc(db, SESSIONS_COLLECTION, sessionId);
@@ -97,12 +98,15 @@ export const requestJoin = async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
+    const sessionData = sessionSnap.data() as Session;
+    const admissionMode = sessionData.admissionMode || 'manual';
+
     const viewerId = uuidv4();
     const viewer: Viewer = {
       id: viewerId,
       name,
       joinedAt: Date.now(),
-      status: 'waiting'
+      status: admissionMode === 'auto' ? 'approved' : 'waiting'
     };
 
     // Update using dot notation to target specific map key
@@ -163,6 +167,30 @@ export const rejectViewer = async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Reject viewer error:', error);
     res.status(500).json({ error: 'Failed to reject viewer' });
+  }
+};
+
+export const updateAdmissionMode = async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id as string;
+    const { mode } = req.body as { mode?: 'auto' | 'manual' };
+
+    if (!mode || (mode !== 'auto' && mode !== 'manual')) {
+      return res.status(400).json({ error: 'Admission mode must be auto or manual' });
+    }
+
+    const sessionRef = doc(db, SESSIONS_COLLECTION, id);
+    const sessionSnap = await getDoc(sessionRef);
+
+    if (!sessionSnap.exists()) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    await updateDoc(sessionRef, { admissionMode: mode });
+    res.json({ message: 'Admission mode updated', mode });
+  } catch (error) {
+    console.error('Update admission mode error:', error);
+    res.status(500).json({ error: 'Failed to update admission mode' });
   }
 };
 

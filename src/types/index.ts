@@ -12,4 +12,5 @@ export interface Session {
   isActive: boolean;
   viewers: Record<string, Viewer>;
   expiresAt: number;
+  admissionMode: 'auto' | 'manual';
 }
