@@ -93,6 +93,17 @@ export const setupSocketEvents = (io: Server) => {
       });
     });
 
+    socket.on('chat-message', (data: { sessionId: string, message: string, senderName: string, senderId: string, timestamp: number }) => {
+      console.log(`Chat message in ${data.sessionId} from ${data.senderName}`);
+      // Broadcast to everyone in the session including the sender for simplicity or just others
+      io.to(data.sessionId).emit('chat-message', data);
+    });
+
+    socket.on('reaction', (data: { sessionId: string, reaction: string, senderName: string, senderId: string }) => {
+      console.log(`Reaction ${data.reaction} in ${data.sessionId} from ${data.senderName}`);
+      socket.to(data.sessionId).emit('reaction', data);
+    });
+
     socket.on('disconnect', () => {
       console.log('User disconnected:', socket.id);
     });
