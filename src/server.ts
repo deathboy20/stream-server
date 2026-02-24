@@ -3,14 +3,16 @@ import cors from 'cors';
 import http from 'http';
 import { Server } from 'socket.io';
 import sessionRoutes from './routes/sessionRoutes';
+import meetingRoutes from './routes/meetingRoutes';
 import { startCleanupJob } from './services/cleanupService';
 import { setupSocketEvents } from './services/socketService';
+import { initFirebase } from './config/firebase';
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow all origins for now
+    origin: "*", 
     methods: ["GET", "POST"]
   }
 });
@@ -28,25 +30,22 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'backend server running',
     endpoints: [
+      '--- Sessions ---',
       'POST   /api/sessions',
       'GET    /api/sessions/:id',
       'DELETE /api/sessions/:id',
-      'GET    /api/sessions/:id/viewers',
-      'POST   /api/sessions/:id/request',
-      'POST   /api/sessions/:id/approve',
-      'POST   /api/sessions/:id/reject',
-      'DELETE /api/sessions/:id/viewers/:viewerId'
+      '--- Meetings ---',
+      'POST   /api/meetings',
+      'GET    /api/meetings/:id',
+      'PUT    /api/meetings/:id',
+      'DELETE /api/meetings/:id',
+      'GET    /api/meetings/user/:userId'
     ]
   });
 });
 
 app.use('/api/sessions', sessionRoutes);
-
-import { initFirebase } from './config/firebase';
-
-// ... (existing imports)
-
-// ...
+app.use('/api/meetings', meetingRoutes);
 
 server.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);

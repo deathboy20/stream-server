@@ -1,12 +1,68 @@
 import { Server, Socket } from 'socket.io';
+import { db } from '../config/firebase';
+import { doc, getDoc } from 'firebase/firestore';
 
 export const setupSocketEvents = (io: Server) => {
+  // Store session host mapping
+  const sessionHosts = new Map<string, string>(); // sessionId -> hostUid
+
   io.on('connection', (socket: Socket) => {
     console.log('User connected:', socket.id);
 
-    socket.on('join-session', (sessionId: string) => {
+    socket.on('join-session', async (data: { sessionId: string, userId?: string }) => {
+      const sessionId = typeof data === 'string' ? data : data.sessionId;
+      const userId = typeof data === 'string' ? null : data.userId;
+      
       socket.join(sessionId);
       console.log(`User ${socket.id} joined session ${sessionId}`);
+
+      // Try to fetch host info if not already cached
+      if (!sessionHosts.has(sessionId)) {
+        try {
+          const meetingSnap = await getDoc(doc(db, 'meetings', sessionId));
+          if (meetingSnap.exists()) {
+            sessionHosts.set(sessionId, meetingSnap.data().hostId);
+          }
+        } catch (err) {
+          console.error("Failed to fetch meeting host:", err);
+        }
+      }
+
+      // If this is the host, mark the socket
+      if (userId && sessionHosts.get(sessionId) === userId) {
+        socket.data.isHost = true;
+        socket.data.userId = userId;
+        console.log(`Host ${userId} joined session ${sessionId}`);
+      }
+    });
+
+    socket.on('host-command', (data: { sessionId: string, command: string, value?: any }) => {
+      if (!socket.data.isHost) {
+        console.warn(`Unauthorized host command from ${socket.id}`);
+        return;
+      }
+      
+      console.log(`Host command: ${data.command} in session ${data.sessionId}`);
+      // Broadcast to everyone in the session except the host
+      socket.to(data.sessionId).emit('peer-command', { 
+        command: data.command, 
+        value: data.value,
+        sender: socket.id 
+      });
+    });
+
+    socket.on('targeted-command', (data: { sessionId: string, targetId: string, command: string, value?: any }) => {
+      if (!socket.data.isHost) {
+        console.warn(`Unauthorized targeted command from ${socket.id}`);
+        return;
+      }
+
+      console.log(`Targeted command: ${data.command} to ${data.targetId}`);
+      io.to(data.targetId).emit('peer-command', {
+        command: data.command,
+        value: data.value,
+        sender: socket.id
+      });
     });
 
     socket.on('join-user', (userId: string) => {
