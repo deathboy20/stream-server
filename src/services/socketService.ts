@@ -9,6 +9,8 @@ export const setupSocketEvents = (io: Server) => {
   io.on('connection', (socket: Socket) => {
     console.log('User connected:', socket.id);
 
+    const pendingRequests = new Map<string, Array<{ viewerId: string; name: string }>>();
+
     socket.on('join-session', async (data: { sessionId: string, userId?: string }) => {
       const sessionId = typeof data === 'string' ? data : data.sessionId;
       const userId = typeof data === 'string' ? null : data.userId;
@@ -34,6 +36,37 @@ export const setupSocketEvents = (io: Server) => {
         socket.data.userId = userId;
         console.log(`Host ${userId} joined session ${sessionId}`);
       }
+    });
+
+    socket.on('join-request', (data: { sessionId: string; viewerId: string; name: string }) => {
+      const { sessionId, viewerId, name } = data;
+      const list = pendingRequests.get(sessionId) || [];
+      list.push({ viewerId, name });
+      pendingRequests.set(sessionId, list);
+      io.to(sessionId).emit('pending-join', { viewerId, name });
+    });
+
+    socket.on('approve-join', (data: { sessionId: string; viewerId: string }) => {
+      if (!socket.data.isHost) {
+        console.warn(`Unauthorized approve-join from ${socket.id}`);
+        return;
+      }
+      const { sessionId, viewerId } = data;
+      const list = pendingRequests.get(sessionId) || [];
+      pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
+      io.to(viewerId).emit('join-approved', { sessionId });
+      io.to(sessionId).emit('viewer-connected', { viewerId });
+    });
+
+    socket.on('reject-join', (data: { sessionId: string; viewerId: string }) => {
+      if (!socket.data.isHost) {
+        console.warn(`Unauthorized reject-join from ${socket.id}`);
+        return;
+      }
+      const { sessionId, viewerId } = data;
+      const list = pendingRequests.get(sessionId) || [];
+      pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
+      io.to(viewerId).emit('join-rejected', { sessionId });
     });
 
     socket.on('host-command', (data: { sessionId: string, command: string, value?: any }) => {
