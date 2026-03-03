@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { db } from '../config/firebase';
-import { collection, doc, setDoc, getDoc, deleteDoc, updateDoc, getDocs, query, where } from 'firebase/firestore';
+import { collection, doc, setDoc, getDoc, deleteDoc, updateDoc, getDocs, query, where, deleteField } from 'firebase/firestore';
 
 const MEETINGS_COLLECTION = 'meetings';
 
@@ -83,5 +83,39 @@ export const listUserMeetings = async (req: Request, res: Response) => {
   } catch (error) {
     console.error('List meetings error:', error);
     res.status(500).json({ error: 'Failed to list meetings' });
+  }
+};
+
+/** Restart (reactivate) an ended meeting. Only the original host can restart. */
+export const restartMeeting = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.body as { userId?: string };
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+    const meetingRef = doc(db, MEETINGS_COLLECTION, id as string);
+    const meetingSnap = await getDoc(meetingRef);
+    if (!meetingSnap.exists()) {
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+    const data = meetingSnap.data() as { hostId: string; isActive?: boolean };
+    if (data.hostId !== userId) {
+      return res.status(403).json({ error: 'Only the host can restart this meeting' });
+    }
+    if (data.isActive !== false) {
+      return res.status(400).json({ error: 'Meeting is already active' });
+    }
+    await updateDoc(meetingRef, {
+      isActive: true,
+      participants: [],
+      endedAt: deleteField(),
+      restartedAt: Date.now()
+    });
+    const updated = (await getDoc(meetingRef)).data();
+    res.json(updated);
+  } catch (error) {
+    console.error('Restart meeting error:', error);
+    res.status(500).json({ error: 'Failed to restart meeting' });
   }
 };

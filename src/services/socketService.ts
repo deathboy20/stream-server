@@ -11,34 +11,39 @@ export const setupSocketEvents = (io: Server) => {
 
     const pendingRequests = new Map<string, Array<{ viewerId: string; name: string }>>();
 
-    socket.on('join-session', async (data: { sessionId: string, userId?: string }) => {
+    socket.on('join-session', async (data: { sessionId: string, userId?: string } | string) => {
       const sessionId = typeof data === 'string' ? data : data.sessionId;
       const userId = typeof data === 'string' ? null : data.userId;
-      
-      // Try to fetch meeting and host info
-      try {
-        const meetingSnap = await getDoc(doc(db, 'meetings', sessionId));
-        if (!meetingSnap.exists() || meetingSnap.data()?.isActive === false) {
-          console.warn(`Attempt to join inactive/non-existent session: ${sessionId}`);
-          socket.emit('meeting-ended', { sessionId });
-          return;
+
+      // If we have a userId, this is a meeting participant/host: verify against 'meetings' collection
+      // If no userId (string payload), this is a streaming session join: skip meeting lookup and just join room.
+      if (userId) {
+        try {
+          const meetingSnap = await getDoc(doc(db, 'meetings', sessionId));
+          if (!meetingSnap.exists() || meetingSnap.data()?.isActive === false) {
+            console.warn(`Attempt to join inactive/non-existent meeting session: ${sessionId}`);
+            socket.emit('meeting-ended', { sessionId });
+            return;
+          }
+
+          if (!sessionHosts.has(sessionId)) {
+            sessionHosts.set(sessionId, meetingSnap.data().hostId);
+          }
+        } catch (err) {
+          console.error("Failed to fetch meeting:", err);
         }
-        
-        if (!sessionHosts.has(sessionId)) {
-          sessionHosts.set(sessionId, meetingSnap.data().hostId);
-        }
-      } catch (err) {
-        console.error("Failed to fetch meeting:", err);
       }
 
       socket.join(sessionId);
       console.log(`User ${socket.id} joined session ${sessionId}`);
       socket.data.sessionId = sessionId;
+      if (userId) {
+        socket.data.userId = userId;
+      }
 
-      // If this is the host, mark the socket
+      // If this is the meeting host, mark the socket
       if (userId && sessionHosts.get(sessionId) === userId) {
         socket.data.isHost = true;
-        socket.data.userId = userId;
         console.log(`Host ${userId} joined session ${sessionId}`);
       }
     });
@@ -240,10 +245,82 @@ export const setupSocketEvents = (io: Server) => {
       })();
     });
 
-
     socket.on('reaction', (data: { sessionId: string, reaction: string, senderName: string, senderId: string }) => {
       console.log(`Reaction ${data.reaction} in ${data.sessionId} from ${data.senderName}`);
       socket.to(data.sessionId).emit('reaction', data);
+    });
+
+    // Participant raise hand
+    socket.on('hand-raised', (data: { sessionId: string; raised: boolean }) => {
+      const sessionId = data.sessionId || (socket.data.sessionId as string | undefined);
+      if (!sessionId) return;
+      console.log(`Hand ${data.raised ? 'raised' : 'lowered'} in ${sessionId} by ${socket.id}`);
+      io.to(sessionId).emit('hand-updated', { viewerId: socket.id, raised: data.raised });
+    });
+
+    // Host pins / unpins a participant
+    socket.on('pin-participant', (data: { sessionId: string; targetId: string | null }) => {
+      if (!socket.data.isHost && !socket.data.isCoHost) {
+        console.warn(`Unauthorized pin-participant from ${socket.id}`);
+        return;
+      }
+      const sessionId = data.sessionId || (socket.data.sessionId as string | undefined);
+      if (!sessionId) return;
+      console.log(`Pin update in ${sessionId}: targetId=${data.targetId}`);
+      io.to(sessionId).emit('pinned-updated', { targetId: data.targetId });
+    });
+
+    // Host transfer to another signed-in participant
+    socket.on('transfer-host', async (data: { sessionId: string; targetId: string }) => {
+      if (!socket.data.isHost) {
+        console.warn(`Unauthorized transfer-host from ${socket.id}`);
+        return;
+      }
+      const sessionId = data.sessionId || (socket.data.sessionId as string | undefined);
+      if (!sessionId) return;
+
+      try {
+        const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.id === data.targetId);
+        if (!targetSocket) {
+          socket.emit('host-transfer-error', { reason: 'Target participant not found' });
+          return;
+        }
+
+        const newHostUserId = targetSocket.data.userId as string | undefined;
+        if (!newHostUserId) {
+          socket.emit('host-transfer-error', { reason: 'Target user must be signed in to become host' });
+          return;
+        }
+
+        const mRef = doc(db, 'meetings', sessionId);
+        const mSnap = await getDoc(mRef);
+        if (!mSnap.exists()) {
+          socket.emit('host-transfer-error', { reason: 'Meeting not found' });
+          return;
+        }
+
+        const docData = mSnap.data() as any;
+        const participants: Array<{ id: string; name: string; role?: string }> =
+          Array.isArray(docData.participants) ? docData.participants : [];
+        const targetParticipant = participants.find(p => p.id === data.targetId);
+        const newHostName = targetParticipant?.name || docData.hostName || 'Host';
+
+        await updateDoc(mRef, { hostId: newHostUserId, hostName: newHostName });
+        sessionHosts.set(sessionId, newHostUserId);
+
+        socket.data.isHost = false;
+        targetSocket.data.isHost = true;
+
+        io.to(sessionId).emit('host-transferred', {
+          sessionId,
+          newHostUserId,
+          newHostName,
+          targetSocketId: data.targetId
+        });
+      } catch (e) {
+        console.error('Failed to transfer host', e);
+        socket.emit('host-transfer-error', { reason: 'Failed to transfer host' });
+      }
     });
 
     socket.on('disconnect', () => {
