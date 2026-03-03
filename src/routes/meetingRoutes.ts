@@ -4,12 +4,14 @@ import {
   getMeeting,
   updateMeeting,
   deleteMeeting,
-  listUserMeetings
+  listUserMeetings,
+  restartMeeting
 } from '../controllers/meetingController';
 
 const router = Router();
 
 router.post('/', createMeeting);
+router.post('/:id/restart', restartMeeting);
 router.get('/user/:userId', listUserMeetings);
 router.get('/:id', getMeeting);
 router.put('/:id', updateMeeting);
