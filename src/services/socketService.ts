@@ -2,40 +2,66 @@ import { Server, Socket } from 'socket.io';
 import { db } from '../config/firebase';
 import { doc, getDoc, updateDoc } from 'firebase/firestore';
 
+interface MeetingMeta {
+  hostId: string;
+  isActive: boolean;
+}
+
+interface PendingRequest {
+  viewerId: string;
+  name: string;
+}
+
 export const setupSocketEvents = (io: Server) => {
-  // Store session host mapping
-  const sessionHosts = new Map<string, string>(); // sessionId -> hostUid
+  const sessionHosts = new Map<string, string>();
+  const meetingCache = new Map<string, MeetingMeta>();
+  const pendingRequests = new Map<string, PendingRequest[]>();
+  const socketQueue = new Map<string, unknown[]>();
+
+  const getMeetingMeta = async (sessionId: string): Promise<MeetingMeta | null> => {
+    if (meetingCache.has(sessionId)) {
+      return meetingCache.get(sessionId)!;
+    }
+    try {
+      const snap = await getDoc(doc(db, 'meetings', sessionId));
+      if (!snap.exists()) return null;
+      const data = snap.data();
+      const meta: MeetingMeta = {
+        hostId: data.hostId,
+        isActive: data.isActive !== false
+      };
+      meetingCache.set(sessionId, meta);
+      return meta;
+    } catch {
+      return null;
+    }
+  };
+
+  const flushQueue = (sessionId: string) => {
+    const queue = socketQueue.get(sessionId) || [];
+    socketQueue.delete(sessionId);
+    queue.forEach(fn => { (fn as () => void)(); });
+  };
 
   io.on('connection', (socket: Socket) => {
     console.log('User connected:', socket.id);
 
-    const pendingRequests = new Map<string, Array<{ viewerId: string; name: string }>>();
-
-    socket.on('join-session', async (data: { sessionId: string, userId?: string } | string) => {
+    socket.on('join-session', async (data: { sessionId: string; userId?: string } | string) => {
       const sessionId = typeof data === 'string' ? data : data.sessionId;
       const userId = typeof data === 'string' ? null : data.userId;
 
-      // If we have a userId, this is a meeting participant/host: verify against 'meetings' collection
-      // If no userId (string payload), this is a streaming session join: skip meeting lookup and just join room.
       if (userId) {
-        try {
-          const meetingSnap = await getDoc(doc(db, 'meetings', sessionId));
-          if (!meetingSnap.exists() || meetingSnap.data()?.isActive === false) {
-            console.warn(`Attempt to join inactive/non-existent meeting session: ${sessionId}`);
-            socket.emit('meeting-ended', { sessionId });
-            return;
-          }
-
-          if (!sessionHosts.has(sessionId)) {
-            sessionHosts.set(sessionId, meetingSnap.data().hostId);
-          }
-        } catch (err) {
-          console.error("Failed to fetch meeting:", err);
+        const meta = await getMeetingMeta(sessionId);
+        if (!meta || !meta.isActive) {
+          socket.emit('meeting-ended', { sessionId });
+          return;
+        }
+        if (!sessionHosts.has(sessionId)) {
+          sessionHosts.set(sessionId, meta.hostId);
         }
       }
 
       socket.join(sessionId);
-      console.log(`User ${socket.id} joined session ${sessionId}`);
       socket.data.sessionId = sessionId;
       if (userId) {
         socket.data.userId = userId;
@@ -44,39 +70,37 @@ export const setupSocketEvents = (io: Server) => {
       const participants = Array.from(io.sockets.adapter.rooms.get(sessionId) || [])
         .filter(id => id !== socket.id)
         .map(id => {
-          const participantSocket = io.sockets.sockets.get(id);
+          const s = io.sockets.sockets.get(id);
           return {
             viewerId: id,
-            name: (participantSocket?.data?.displayName as string | undefined) || 'Guest',
-            isHost: !!participantSocket?.data?.isHost
+            name: (s?.data?.displayName as string | undefined) || 'Guest',
+            isHost: !!s?.data?.isHost
           };
         });
       socket.emit('session-participants', { sessionId, participants });
 
-      // Restore host status if this userId matches the stored host for this session
       if (userId && sessionHosts.get(sessionId) === userId) {
         socket.data.isHost = true;
         console.log(`Host ${userId} rejoined session ${sessionId}`);
       }
+
+      setTimeout(() => flushQueue(sessionId), 0);
     });
 
     socket.on('join-request', async (data: { sessionId: string; viewerId: string; name: string }) => {
       const { sessionId, viewerId, name } = data;
-      
-      try {
-        const meetingSnap = await getDoc(doc(db, 'meetings', sessionId));
-        if (!meetingSnap.exists() || meetingSnap.data()?.isActive === false) {
-          console.warn(`Join request for inactive session ${sessionId}`);
-          io.to(viewerId).emit('join-rejected', { sessionId, reason: 'Meeting has ended' });
-          return;
-        }
-      } catch (e) {
-        console.error('Failed to verify meeting for join request', e);
+
+      const meta = await getMeetingMeta(sessionId);
+      if (!meta || !meta.isActive) {
+        io.to(viewerId).emit('join-rejected', { sessionId, reason: 'Meeting has ended' });
+        return;
       }
 
       const list = pendingRequests.get(sessionId) || [];
-      list.push({ viewerId, name });
-      pendingRequests.set(sessionId, list);
+      if (!list.find(r => r.viewerId === viewerId)) {
+        list.push({ viewerId, name });
+        pendingRequests.set(sessionId, list);
+      }
       io.to(sessionId).emit('pending-join', { viewerId, name });
     });
 
@@ -89,17 +113,22 @@ export const setupSocketEvents = (io: Server) => {
       const list = pendingRequests.get(sessionId) || [];
       const entry = list.find(r => r.viewerId === viewerId) || { viewerId, name: 'Guest' };
       pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
+
       io.to(viewerId).emit('join-approved', { sessionId });
       io.to(sessionId).emit('viewer-connected', { viewerId, name: entry.name, isHost: false });
+      io.to(sessionId).emit('pending-requests-updated', { viewerId });
+
       (async () => {
         try {
           const mRef = doc(db, 'meetings', sessionId);
           const mSnap = await getDoc(mRef);
           if (mSnap.exists()) {
-            const data = mSnap.data() as any;
-            const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(data.participants) ? data.participants : [];
+            const d = mSnap.data() as any;
+            const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(d.participants) ? d.participants : [];
             const exists = participants.find(p => p.id === viewerId);
-            const updated = exists ? participants.map(p => p.id === viewerId ? { ...p, name: entry.name } : p) : [...participants, { id: viewerId, name: entry.name, role: 'participant' }];
+            const updated = exists
+              ? participants.map(p => p.id === viewerId ? { ...p, name: entry.name } : p)
+              : [...participants, { id: viewerId, name: entry.name, role: 'participant' }];
             await updateDoc(mRef, { participants: updated });
           }
         } catch (e) {
@@ -109,38 +138,25 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('reject-join', (data: { sessionId: string; viewerId: string }) => {
-      if (!socket.data.isHost) {
-        console.warn(`Unauthorized reject-join from ${socket.id}`);
-        return;
-      }
+      if (!socket.data.isHost) return;
       const { sessionId, viewerId } = data;
       const list = pendingRequests.get(sessionId) || [];
       pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
       io.to(viewerId).emit('join-rejected', { sessionId });
+      io.to(sessionId).emit('pending-requests-updated', { viewerId });
     });
 
-    socket.on('host-command', (data: { sessionId: string, command: string, value?: any }) => {
-      if (!socket.data.isHost) {
-        console.warn(`Unauthorized host command from ${socket.id}`);
-        return;
-      }
-      
-      console.log(`Host command: ${data.command} in session ${data.sessionId}`);
-      // Broadcast to everyone in the session except the host
-      socket.to(data.sessionId).emit('peer-command', { 
-        command: data.command, 
+    socket.on('host-command', (data: { sessionId: string; command: string; value?: unknown }) => {
+      if (!socket.data.isHost) return;
+      socket.to(data.sessionId).emit('peer-command', {
+        command: data.command,
         value: data.value,
-        sender: socket.id 
+        sender: socket.id
       });
     });
 
-    socket.on('targeted-command', (data: { sessionId: string, targetId: string, command: string, value?: any }) => {
-      if (!socket.data.isHost) {
-        console.warn(`Unauthorized targeted command from ${socket.id}`);
-        return;
-      }
-
-      console.log(`Targeted command: ${data.command} to ${data.targetId}`);
+    socket.on('targeted-command', (data: { sessionId: string; targetId: string; command: string; value?: unknown }) => {
+      if (!socket.data.isHost) return;
       io.to(data.targetId).emit('peer-command', {
         command: data.command,
         value: data.value,
@@ -150,14 +166,16 @@ export const setupSocketEvents = (io: Server) => {
 
     socket.on('join-user', (userId: string) => {
       socket.join(userId);
-      console.log(`User ${socket.id} joined user room ${userId}`);
     });
 
     socket.on('viewer-connected', (data: { sessionId: string; viewerId: string; name?: string }) => {
-        socket.data.displayName = data.name || socket.data.displayName || 'Guest';
-        socket.data.displayName = data.name || socket.data.displayName || 'Guest';
-        console.log(`Viewer ${data.viewerId} connected to session ${data.sessionId}`);
-        socket.to(data.sessionId).emit('viewer-connected', { viewerId: data.viewerId, name: data.name, isHost: !!socket.data.isHost });
+      socket.data.displayName = data.name || socket.data.displayName || 'Guest';
+      console.log(`Viewer ${data.viewerId} connected to session ${data.sessionId}`);
+      socket.to(data.sessionId).emit('viewer-connected', {
+        viewerId: data.viewerId,
+        name: data.name,
+        isHost: !!socket.data.isHost
+      });
     });
 
     socket.on('get-session-participants', (data: { sessionId: string }) => {
@@ -166,27 +184,27 @@ export const setupSocketEvents = (io: Server) => {
       const participants = Array.from(io.sockets.adapter.rooms.get(sessionId) || [])
         .filter(id => id !== socket.id)
         .map(id => {
-          const participantSocket = io.sockets.sockets.get(id);
+          const s = io.sockets.sockets.get(id);
           return {
             viewerId: id,
-            name: (participantSocket?.data?.displayName as string | undefined) || 'Guest',
-            isHost: !!participantSocket?.data?.isHost
+            name: (s?.data?.displayName as string | undefined) || 'Guest',
+            isHost: !!s?.data?.isHost
           };
         });
       socket.emit('session-participants', { sessionId, participants });
     });
 
     socket.on('viewer-ready', (data: { sessionId: string; viewerId: string }) => {
-        console.log(`Viewer ${data.viewerId} ready for WebRTC in session ${data.sessionId}`);
-        socket.to(data.sessionId).emit('viewer-ready', { viewerId: data.viewerId });
+      console.log(`Viewer ${data.viewerId} ready for WebRTC in session ${data.sessionId}`);
+      socket.to(data.sessionId).emit('viewer-ready', { viewerId: data.viewerId });
     });
 
     socket.on('viewer-watching', (data: { sessionId: string; viewerId: string }) => {
-        console.log(`Viewer ${data.viewerId} is now watching the stream in session ${data.sessionId}`);
-        socket.to(data.sessionId).emit('viewer-watching', { viewerId: data.viewerId });
+      console.log(`Viewer ${data.viewerId} is now watching`);
+      socket.to(data.sessionId).emit('viewer-watching', { viewerId: data.viewerId });
     });
 
-    socket.on('signal', (data: { target: string; signal: any; sessionId: string; metadata?: any }) => {
+    socket.on('signal', (data: { target: string; signal: unknown; sessionId: string; metadata?: unknown }) => {
       io.to(data.target).emit('signal', {
         signal: data.signal,
         sender: socket.id,
@@ -194,22 +212,19 @@ export const setupSocketEvents = (io: Server) => {
       });
     });
 
-    socket.on('chat-message', (data: { sessionId: string, message: string, senderName: string, senderId: string, timestamp: number }) => {
-      console.log(`Chat message in ${data.sessionId} from ${data.senderName}`);
+    socket.on('chat-message', (data: { sessionId: string; message: string; senderName: string; senderId: string; timestamp: number }) => {
       io.to(data.sessionId).emit('chat-message', data);
     });
 
     socket.on('end-meeting', (data: { sessionId: string }) => {
-      if (!socket.data.isHost) {
-        console.warn(`Unauthorized end-meeting from ${socket.id}`);
-        return;
-      }
+      if (!socket.data.isHost) return;
       console.log(`Meeting ${data.sessionId} ended by host`);
       io.to(data.sessionId).emit('meeting-ended', { sessionId: data.sessionId });
+      meetingCache.delete(data.sessionId);
+      pendingRequests.delete(data.sessionId);
       (async () => {
         try {
-          const mRef = doc(db, 'meetings', data.sessionId);
-          await updateDoc(mRef, { isActive: false, endedAt: Date.now() });
+          await updateDoc(doc(db, 'meetings', data.sessionId), { isActive: false, endedAt: Date.now() });
         } catch (e) {
           console.error('Failed to persist meeting end', e);
         }
@@ -228,8 +243,8 @@ export const setupSocketEvents = (io: Server) => {
           const mRef = doc(db, 'meetings', data.sessionId);
           const mSnap = await getDoc(mRef);
           if (mSnap.exists()) {
-            const docData = mSnap.data() as any;
-            const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(docData.participants) ? docData.participants : [];
+            const d = mSnap.data() as any;
+            const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(d.participants) ? d.participants : [];
             const updated = participants.map(p => p.id === data.viewerId ? { ...p, name: data.name } : p);
             await updateDoc(mRef, { participants: updated });
           }
@@ -240,33 +255,22 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('update-role', (data: { sessionId: string; targetId: string; role: string }) => {
-      if (!socket.data.isHost) {
-        console.warn(`Unauthorized update-role from ${socket.id}`);
-        return;
-      }
+      if (!socket.data.isHost) return;
       io.to(data.sessionId).emit('role-updated', { targetId: data.targetId, role: data.role });
-      
+
       (async () => {
         try {
           const mRef = doc(db, 'meetings', data.sessionId);
           const mSnap = await getDoc(mRef);
           if (mSnap.exists()) {
-            const docData = mSnap.data() as any;
-            const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(docData.participants) ? docData.participants : [];
+            const d = mSnap.data() as any;
+            const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(d.participants) ? d.participants : [];
             const updated = participants.map(p => p.id === data.targetId ? { ...p, role: data.role } : p);
             await updateDoc(mRef, { participants: updated });
-            
-            // Mark target socket explicitly with co-host if promoted
-            if (data.role === 'co-host') {
-                const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.id === data.targetId);
-                if (targetSocket) {
-                    targetSocket.data.isCoHost = true;
-                }
-            } else if (data.role === 'participant') {
-                const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.id === data.targetId);
-                if (targetSocket) {
-                    targetSocket.data.isCoHost = false;
-                }
+
+            const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.id === data.targetId);
+            if (targetSocket) {
+              targetSocket.data.isCoHost = data.role === 'co-host';
             }
           }
         } catch (e) {
@@ -275,68 +279,54 @@ export const setupSocketEvents = (io: Server) => {
       })();
     });
 
-    socket.on('reaction', (data: { sessionId: string, reaction: string, senderName: string, senderId: string }) => {
-      console.log(`Reaction ${data.reaction} in ${data.sessionId} from ${data.senderName}`);
-      socket.to(data.sessionId).emit('reaction', data);
+    socket.on('reaction', (data: { sessionId: string; reaction: string; senderName: string; senderId: string }) => {
+      io.to(data.sessionId).emit('reaction', data);
     });
 
-    // Participant raise hand
     socket.on('hand-raised', (data: { sessionId: string; raised: boolean }) => {
       const sessionId = data.sessionId || (socket.data.sessionId as string | undefined);
       if (!sessionId) return;
-      console.log(`Hand ${data.raised ? 'raised' : 'lowered'} in ${sessionId} by ${socket.id}`);
       io.to(sessionId).emit('hand-updated', { viewerId: socket.id, raised: data.raised });
     });
 
-    // Host pins / unpins a participant
     socket.on('pin-participant', (data: { sessionId: string; targetId: string | null }) => {
-      if (!socket.data.isHost && !socket.data.isCoHost) {
-        console.warn(`Unauthorized pin-participant from ${socket.id}`);
-        return;
-      }
+      if (!socket.data.isHost && !socket.data.isCoHost) return;
       const sessionId = data.sessionId || (socket.data.sessionId as string | undefined);
       if (!sessionId) return;
-      console.log(`Pin update in ${sessionId}: targetId=${data.targetId}`);
       io.to(sessionId).emit('pinned-updated', { targetId: data.targetId });
     });
 
-    // Host transfer to another signed-in participant
     socket.on('transfer-host', async (data: { sessionId: string; targetId: string }) => {
-      if (!socket.data.isHost) {
-        console.warn(`Unauthorized transfer-host from ${socket.id}`);
-        return;
-      }
+      if (!socket.data.isHost) return;
       const sessionId = data.sessionId || (socket.data.sessionId as string | undefined);
       if (!sessionId) return;
 
+      const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.id === data.targetId);
+      if (!targetSocket) {
+        socket.emit('host-transfer-error', { reason: 'Target participant not found' });
+        return;
+      }
+      const newHostUserId = targetSocket.data.userId as string | undefined;
+      if (!newHostUserId) {
+        socket.emit('host-transfer-error', { reason: 'Target user must be signed in to become host' });
+        return;
+      }
+
       try {
-        const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.id === data.targetId);
-        if (!targetSocket) {
-          socket.emit('host-transfer-error', { reason: 'Target participant not found' });
-          return;
-        }
-
-        const newHostUserId = targetSocket.data.userId as string | undefined;
-        if (!newHostUserId) {
-          socket.emit('host-transfer-error', { reason: 'Target user must be signed in to become host' });
-          return;
-        }
-
         const mRef = doc(db, 'meetings', sessionId);
         const mSnap = await getDoc(mRef);
         if (!mSnap.exists()) {
           socket.emit('host-transfer-error', { reason: 'Meeting not found' });
           return;
         }
-
-        const docData = mSnap.data() as any;
-        const participants: Array<{ id: string; name: string; role?: string }> =
-          Array.isArray(docData.participants) ? docData.participants : [];
+        const d = mSnap.data() as any;
+        const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(d.participants) ? d.participants : [];
         const targetParticipant = participants.find(p => p.id === data.targetId);
-        const newHostName = targetParticipant?.name || docData.hostName || 'Host';
+        const newHostName = targetParticipant?.name || d.hostName || 'Host';
 
         await updateDoc(mRef, { hostId: newHostUserId, hostName: newHostName });
         sessionHosts.set(sessionId, newHostUserId);
+        meetingCache.set(sessionId, { ...meetingCache.get(sessionId)!, hostId: newHostUserId });
 
         socket.data.isHost = false;
         targetSocket.data.isHost = true;
@@ -361,13 +351,14 @@ export const setupSocketEvents = (io: Server) => {
         if (socket.data.isHost) {
           io.to(sessionId).emit('host-left', { sessionId });
         }
+        pendingRequests.delete(sessionId);
         (async () => {
           try {
             const mRef = doc(db, 'meetings', sessionId);
             const mSnap = await getDoc(mRef);
             if (mSnap.exists()) {
-              const data = mSnap.data() as any;
-              const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(data.participants) ? data.participants : [];
+              const d = mSnap.data() as any;
+              const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(d.participants) ? d.participants : [];
               const updated = participants.filter(p => p.id !== socket.id);
               await updateDoc(mRef, { participants: updated });
             }
