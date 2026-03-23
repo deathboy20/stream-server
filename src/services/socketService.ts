@@ -41,10 +41,22 @@ export const setupSocketEvents = (io: Server) => {
         socket.data.userId = userId;
       }
 
-      // If this is the meeting host, mark the socket
+      const participants = Array.from(io.sockets.adapter.rooms.get(sessionId) || [])
+        .filter(id => id !== socket.id)
+        .map(id => {
+          const participantSocket = io.sockets.sockets.get(id);
+          return {
+            viewerId: id,
+            name: (participantSocket?.data?.displayName as string | undefined) || 'Guest',
+            isHost: !!participantSocket?.data?.isHost
+          };
+        });
+      socket.emit('session-participants', { sessionId, participants });
+
+      // Restore host status if this userId matches the stored host for this session
       if (userId && sessionHosts.get(sessionId) === userId) {
         socket.data.isHost = true;
-        console.log(`Host ${userId} joined session ${sessionId}`);
+        console.log(`Host ${userId} rejoined session ${sessionId}`);
       }
     });
 
@@ -78,7 +90,7 @@ export const setupSocketEvents = (io: Server) => {
       const entry = list.find(r => r.viewerId === viewerId) || { viewerId, name: 'Guest' };
       pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
       io.to(viewerId).emit('join-approved', { sessionId });
-      io.to(sessionId).emit('viewer-connected', { viewerId, name: entry.name });
+      io.to(sessionId).emit('viewer-connected', { viewerId, name: entry.name, isHost: false });
       (async () => {
         try {
           const mRef = doc(db, 'meetings', sessionId);
@@ -142,8 +154,25 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('viewer-connected', (data: { sessionId: string; viewerId: string; name?: string }) => {
+        socket.data.displayName = data.name || socket.data.displayName || 'Guest';
         console.log(`Viewer ${data.viewerId} connected to session ${data.sessionId}`);
-        socket.to(data.sessionId).emit('viewer-connected', { viewerId: data.viewerId, name: data.name });
+        socket.to(data.sessionId).emit('viewer-connected', { viewerId: data.viewerId, name: data.name, isHost: !!socket.data.isHost });
+    });
+
+    socket.on('get-session-participants', (data: { sessionId: string }) => {
+      const sessionId = data?.sessionId || (socket.data.sessionId as string | undefined);
+      if (!sessionId) return;
+      const participants = Array.from(io.sockets.adapter.rooms.get(sessionId) || [])
+        .filter(id => id !== socket.id)
+        .map(id => {
+          const participantSocket = io.sockets.sockets.get(id);
+          return {
+            viewerId: id,
+            name: (participantSocket?.data?.displayName as string | undefined) || 'Guest',
+            isHost: !!participantSocket?.data?.isHost
+          };
+        });
+      socket.emit('session-participants', { sessionId, participants });
     });
 
     socket.on('viewer-ready', (data: { sessionId: string; viewerId: string }) => {
