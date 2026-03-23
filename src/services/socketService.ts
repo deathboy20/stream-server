@@ -155,6 +155,7 @@ export const setupSocketEvents = (io: Server) => {
 
     socket.on('viewer-connected', (data: { sessionId: string; viewerId: string; name?: string }) => {
         socket.data.displayName = data.name || socket.data.displayName || 'Guest';
+        socket.data.displayName = data.name || socket.data.displayName || 'Guest';
         console.log(`Viewer ${data.viewerId} connected to session ${data.sessionId}`);
         socket.to(data.sessionId).emit('viewer-connected', { viewerId: data.viewerId, name: data.name, isHost: !!socket.data.isHost });
     });
