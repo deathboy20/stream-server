@@ -176,6 +176,17 @@ export const setupSocketEvents = (io: Server) => {
         name: data.name,
         isHost: !!socket.data.isHost
       });
+      const participants = Array.from(io.sockets.adapter.rooms.get(data.sessionId) || [])
+        .filter(id => id !== socket.id)
+        .map(id => {
+          const s = io.sockets.sockets.get(id);
+          return {
+            viewerId: id,
+            name: (s?.data?.displayName as string | undefined) || 'Guest',
+            isHost: !!s?.data?.isHost
+          };
+        });
+      io.to(data.sessionId).emit('session-participants', { sessionId: data.sessionId, participants });
     });
 
     socket.on('get-session-participants', (data: { sessionId: string }) => {
@@ -348,6 +359,17 @@ export const setupSocketEvents = (io: Server) => {
       const sessionId = socket.data.sessionId as string | undefined;
       if (sessionId) {
         io.to(sessionId).emit('viewer-left', { viewerId: socket.id });
+        const participants = Array.from(io.sockets.adapter.rooms.get(sessionId) || [])
+          .filter(id => id !== socket.id)
+          .map(id => {
+            const s = io.sockets.sockets.get(id);
+            return {
+              viewerId: id,
+              name: (s?.data?.displayName as string | undefined) || 'Guest',
+              isHost: !!s?.data?.isHost
+            };
+          });
+        io.to(sessionId).emit('session-participants', { sessionId, participants });
         if (socket.data.isHost) {
           io.to(sessionId).emit('host-left', { sessionId });
         }
