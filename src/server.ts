@@ -7,19 +7,28 @@ import meetingRoutes from './routes/meetingRoutes';
 import { startCleanupJob } from './services/cleanupService';
 import { setupSocketEvents } from './services/socketService';
 import { initFirebase } from './config/firebase';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const PORT = process.env.PORT || 3001;
+const CORS_ORIGINS = process.env.CORS_ORIGINS?.split(',') || ['http://localhost:5173'];
+const CORS_CREDENTIALS = process.env.CORS_CREDENTIALS === 'true';
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", 
-    methods: ["GET", "POST"]
+    origin: CORS_ORIGINS,
+    methods: ["GET", "POST"],
+    credentials: CORS_CREDENTIALS
   }
 });
 
-const PORT = process.env.PORT || 3001;
-
-app.use(cors());
+app.use(cors({
+  origin: CORS_ORIGINS,
+  credentials: CORS_CREDENTIALS
+}));
 app.use(express.json());
 
 // Initialize Socket.IO events
