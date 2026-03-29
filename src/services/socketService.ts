@@ -1,5 +1,5 @@
 import { Server, Socket } from 'socket.io';
-import { db } from '../config/firebase';
+import { adminAuth, db } from '../config/firebase';
 import { doc, getDoc, updateDoc } from 'firebase/firestore';
 
 interface MeetingMeta {
@@ -13,6 +13,7 @@ interface PendingRequest {
 }
 
 export const setupSocketEvents = (io: Server) => {
+  const MEETINGS_COLLECTION = 'tele-meet';
   const sessionHosts = new Map<string, string>();
   const meetingCache = new Map<string, MeetingMeta>();
   const pendingRequests = new Map<string, PendingRequest[]>();
@@ -23,7 +24,7 @@ export const setupSocketEvents = (io: Server) => {
       return meetingCache.get(sessionId)!;
     }
     try {
-      const snap = await getDoc(doc(db, 'meetings', sessionId));
+      const snap = await getDoc(doc(db, MEETINGS_COLLECTION, sessionId));
       if (!snap.exists()) return null;
       const data = snap.data();
       const meta: MeetingMeta = {
@@ -43,6 +44,27 @@ export const setupSocketEvents = (io: Server) => {
     queue.forEach(fn => { (fn as () => void)(); });
   };
 
+  io.use(async (socket, next) => {
+    try {
+      const tokenFromAuth = typeof socket.handshake.auth?.token === 'string'
+        ? socket.handshake.auth.token
+        : null;
+      const authHeader = socket.handshake.headers.authorization;
+      const tokenFromHeader = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7)
+        : null;
+      const token = tokenFromAuth || tokenFromHeader;
+      if (token) {
+        const decoded = await adminAuth.verifyIdToken(token);
+        socket.data.firebaseUid = decoded.uid;
+        socket.data.firebaseEmail = decoded.email || '';
+      }
+      next();
+    } catch (error) {
+      next(new Error('Unauthorized socket connection'));
+    }
+  });
+
   io.on('connection', (socket: Socket) => {
     console.log('User connected:', socket.id);
 
@@ -51,6 +73,11 @@ export const setupSocketEvents = (io: Server) => {
       const userId = typeof data === 'string' ? null : data.userId;
 
       if (userId) {
+        const firebaseUid = socket.data.firebaseUid as string | undefined;
+        if (!firebaseUid || firebaseUid !== userId) {
+          socket.emit('join-error', { sessionId, error: 'Invalid user identity' });
+          return;
+        }
         const meta = await getMeetingMeta(sessionId);
         if (!meta || !meta.isActive) {
           socket.emit('meeting-ended', { sessionId });
@@ -120,7 +147,7 @@ export const setupSocketEvents = (io: Server) => {
 
       (async () => {
         try {
-          const mRef = doc(db, 'meetings', sessionId);
+          const mRef = doc(db, MEETINGS_COLLECTION, sessionId);
           const mSnap = await getDoc(mRef);
           if (mSnap.exists()) {
             const d = mSnap.data() as any;
@@ -228,14 +255,36 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('end-meeting', (data: { sessionId: string }) => {
-      if (!socket.data.isHost) return;
+      if (!data?.sessionId) {
+        socket.emit('meeting-end-error', { error: 'Missing session ID' });
+        return;
+      }
+      if (!socket.data.isHost) {
+        socket.emit('meeting-end-error', { error: 'Only host can end the meeting' });
+        return;
+      }
       console.log(`Meeting ${data.sessionId} ended by host`);
       io.to(data.sessionId).emit('meeting-ended', { sessionId: data.sessionId });
-      meetingCache.delete(data.sessionId);
+      const cached = meetingCache.get(data.sessionId);
+      if (cached) {
+        meetingCache.set(data.sessionId, { ...cached, isActive: false });
+      }
       pendingRequests.delete(data.sessionId);
+      const socketsInRoom = Array.from(io.sockets.adapter.rooms.get(data.sessionId) || []);
+      socketsInRoom.forEach((socketId) => {
+        const participantSocket = io.sockets.sockets.get(socketId);
+        if (!participantSocket) return;
+        participantSocket.leave(data.sessionId);
+        if ((participantSocket.data.sessionId as string | undefined) === data.sessionId) {
+          delete participantSocket.data.sessionId;
+        }
+        if (participantSocket.data.isHost) {
+          participantSocket.data.isHost = false;
+        }
+      });
       (async () => {
         try {
-          await updateDoc(doc(db, 'meetings', data.sessionId), { isActive: false, endedAt: Date.now() });
+          await updateDoc(doc(db, MEETINGS_COLLECTION, data.sessionId), { isActive: false, endedAt: Date.now() });
         } catch (e) {
           console.error('Failed to persist meeting end', e);
         }
@@ -251,7 +300,7 @@ export const setupSocketEvents = (io: Server) => {
       io.to(data.sessionId).emit('name-updated', { viewerId: data.viewerId, name: data.name });
       (async () => {
         try {
-          const mRef = doc(db, 'meetings', data.sessionId);
+          const mRef = doc(db, MEETINGS_COLLECTION, data.sessionId);
           const mSnap = await getDoc(mRef);
           if (mSnap.exists()) {
             const d = mSnap.data() as any;
@@ -271,7 +320,7 @@ export const setupSocketEvents = (io: Server) => {
 
       (async () => {
         try {
-          const mRef = doc(db, 'meetings', data.sessionId);
+          const mRef = doc(db, MEETINGS_COLLECTION, data.sessionId);
           const mSnap = await getDoc(mRef);
           if (mSnap.exists()) {
             const d = mSnap.data() as any;
@@ -324,7 +373,7 @@ export const setupSocketEvents = (io: Server) => {
       }
 
       try {
-        const mRef = doc(db, 'meetings', sessionId);
+        const mRef = doc(db, MEETINGS_COLLECTION, sessionId);
         const mSnap = await getDoc(mRef);
         if (!mSnap.exists()) {
           socket.emit('host-transfer-error', { reason: 'Meeting not found' });
@@ -376,7 +425,7 @@ export const setupSocketEvents = (io: Server) => {
         pendingRequests.delete(sessionId);
         (async () => {
           try {
-            const mRef = doc(db, 'meetings', sessionId);
+            const mRef = doc(db, MEETINGS_COLLECTION, sessionId);
             const mSnap = await getDoc(mRef);
             if (mSnap.exists()) {
               const d = mSnap.data() as any;

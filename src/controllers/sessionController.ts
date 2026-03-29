@@ -3,16 +3,21 @@ import { Session, Viewer } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../config/firebase';
 import { collection, doc, setDoc, getDoc, deleteDoc, updateDoc, getDocs } from 'firebase/firestore';
+import { AuthenticatedRequest } from '../middleware/auth';
 
 const SESSIONS_COLLECTION = 'sessions';
 
-export const createSession = async (req: Request, res: Response) => {
+export const createSession = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const sessionId = uuidv4();
     const now = Date.now();
+    const hostId = req.authUser?.uid;
+    if (!hostId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     const session: Session = {
       id: sessionId,
-      hostId: 'host_' + sessionId, // Simple host ID generation
+      hostId,
       createdAt: now,
       isActive: true,
       viewers: {}, // This will be handled as a subcollection or map depending on structure, but for simplicity keeping as empty obj here
@@ -54,10 +59,18 @@ export const getSession = async (req: Request, res: Response) => {
   }
 };
 
-export const endSession = async (req: Request, res: Response) => {
+export const endSession = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = req.params.id as string;
     const sessionRef = doc(db, SESSIONS_COLLECTION, id);
+    const sessionSnap = await getDoc(sessionRef);
+    if (!sessionSnap.exists()) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    const session = sessionSnap.data() as Session;
+    if (session.hostId !== req.authUser?.uid) {
+      return res.status(403).json({ error: 'Only host can end session' });
+    }
     await deleteDoc(sessionRef);
     res.json({ message: 'Session ended' });
   } catch (error) {
@@ -121,7 +134,7 @@ export const requestJoin = async (req: Request, res: Response) => {
   }
 };
 
-export const approveViewer = async (req: Request, res: Response) => {
+export const approveViewer = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = req.params.id as string;
     const { viewerId } = req.body;
@@ -134,6 +147,10 @@ export const approveViewer = async (req: Request, res: Response) => {
     const sessionSnap = await getDoc(sessionRef);
     if (!sessionSnap.exists()) {
       return res.status(404).json({ error: 'Session not found' });
+    }
+    const session = sessionSnap.data() as Session;
+    if (session.hostId !== req.authUser?.uid) {
+      return res.status(403).json({ error: 'Only host can approve viewers' });
     }
 
     // We update the specific viewer's status
@@ -149,7 +166,7 @@ export const approveViewer = async (req: Request, res: Response) => {
   }
 };
 
-export const rejectViewer = async (req: Request, res: Response) => {
+export const rejectViewer = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = req.params.id as string;
     const { viewerId } = req.body;
@@ -157,6 +174,14 @@ export const rejectViewer = async (req: Request, res: Response) => {
     if (!viewerId) return res.status(400).json({ error: 'Viewer ID is required' });
 
     const sessionRef = doc(db, SESSIONS_COLLECTION, id);
+    const sessionSnap = await getDoc(sessionRef);
+    if (!sessionSnap.exists()) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    const session = sessionSnap.data() as Session;
+    if (session.hostId !== req.authUser?.uid) {
+      return res.status(403).json({ error: 'Only host can reject viewers' });
+    }
 
     await updateDoc(sessionRef, {
       [`viewers.${viewerId}.status`]: 'rejected'
@@ -170,7 +195,7 @@ export const rejectViewer = async (req: Request, res: Response) => {
   }
 };
 
-export const updateAdmissionMode = async (req: Request, res: Response) => {
+export const updateAdmissionMode = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = req.params.id as string;
     const { mode } = req.body as { mode?: 'auto' | 'manual' };
@@ -185,6 +210,10 @@ export const updateAdmissionMode = async (req: Request, res: Response) => {
     if (!sessionSnap.exists()) {
       return res.status(404).json({ error: 'Session not found' });
     }
+    const session = sessionSnap.data() as Session;
+    if (session.hostId !== req.authUser?.uid) {
+      return res.status(403).json({ error: 'Only host can change admission mode' });
+    }
 
     await updateDoc(sessionRef, { admissionMode: mode });
     res.json({ message: 'Admission mode updated', mode });
@@ -194,7 +223,7 @@ export const updateAdmissionMode = async (req: Request, res: Response) => {
   }
 };
 
-export const removeViewer = async (req: Request, res: Response) => {
+export const removeViewer = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = req.params.id as string;
     const viewerId = req.params.viewerId as string;
@@ -204,6 +233,10 @@ export const removeViewer = async (req: Request, res: Response) => {
 
     if (!sessionSnap.exists()) {
       return res.status(404).json({ error: 'Session not found' });
+    }
+    const session = sessionSnap.data() as Session;
+    if (session.hostId !== req.authUser?.uid) {
+      return res.status(403).json({ error: 'Only host can remove viewers' });
     }
 
     // To delete a field in Firestore, use deleteField()

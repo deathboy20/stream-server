@@ -12,23 +12,47 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const PORT = process.env.PORT || 3001;
-const CORS_ORIGINS = process.env.CORS_ORIGINS?.split(',') || ['http://localhost:5173'];
+const CORS_ORIGINS = process.env.CORS_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean) || [];
 const CORS_CREDENTIALS = process.env.CORS_CREDENTIALS === 'true';
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'https://sigtrack-stream.vercel.app',
+  'https://prod-sigtrackweb.sigtrackapp.com',
+  'https://staging-sigtrackweb.sigtrackapp.com'
+];
+const allowedOrigins = new Set([...DEFAULT_ALLOWED_ORIGINS, ...CORS_ORIGINS]);
+
+const isOriginAllowed = (origin?: string | null) => {
+  if (!origin) return true;
+  if (allowedOrigins.has(origin)) return true;
+  if (origin.endsWith('.vercel.app')) return true;
+  return false;
+};
+
+const corsOptions = {
+  origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+    if (isOriginAllowed(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`CORS origin denied: ${origin || 'unknown'}`));
+  },
+  credentials: CORS_CREDENTIALS,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-firebase-token'],
+};
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: CORS_ORIGINS,
-    methods: ["GET", "POST"],
-    credentials: CORS_CREDENTIALS
-  }
+  cors: corsOptions,
+  transports: ['websocket', 'polling']
 });
 
-app.use(cors({
-  origin: CORS_ORIGINS,
-  credentials: CORS_CREDENTIALS
-}));
+app.set('trust proxy', 1);
+app.use(cors(corsOptions));
+app.options('/{*splat}', cors(corsOptions));
 app.use(express.json());
 
 // Initialize Socket.IO events

@@ -1,12 +1,14 @@
 import { Request, Response } from 'express';
 import { db } from '../config/firebase';
 import { collection, doc, setDoc, getDoc, deleteDoc, updateDoc, getDocs, query, where, deleteField } from 'firebase/firestore';
+import { AuthenticatedRequest } from '../middleware/auth';
 
-const MEETINGS_COLLECTION = 'meetings';
+const MEETINGS_COLLECTION = 'tele-meet';
 
-export const createMeeting = async (req: Request, res: Response) => {
+export const createMeeting = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { id, hostId, hostName, title, scheduledAt } = req.body;
+    const { id, hostName, title, scheduledAt, orgName, team, userType } = req.body;
+    const hostId = req.authUser?.uid;
     
     if (!id || !hostId) {
       return res.status(400).json({ error: 'Meeting ID and Host ID are required' });
@@ -16,7 +18,11 @@ export const createMeeting = async (req: Request, res: Response) => {
       id,
       hostId,
       hostName: hostName || 'Anonymous',
+      hostEmail: req.authUser?.email || '',
       title: title || 'New Meeting',
+      orgName: orgName || 'Unknown Org',
+      team: team || null,
+      userType: userType || null,
       createdAt: Date.now(),
       scheduledAt: scheduledAt || Date.now(),
       isActive: true,
@@ -47,11 +53,20 @@ export const getMeeting = async (req: Request, res: Response) => {
   }
 };
 
-export const updateMeeting = async (req: Request, res: Response) => {
+export const updateMeeting = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const updates = req.body;
     const meetingRef = doc(db, MEETINGS_COLLECTION, id as string);
+    const meetingSnap = await getDoc(meetingRef);
+
+    if (!meetingSnap.exists()) {
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+    const meeting = meetingSnap.data() as { hostId: string };
+    if (meeting.hostId !== req.authUser?.uid) {
+      return res.status(403).json({ error: 'Only host can update meeting' });
+    }
     
     await updateDoc(meetingRef, updates);
     res.json({ message: 'Meeting updated successfully' });
@@ -61,10 +76,19 @@ export const updateMeeting = async (req: Request, res: Response) => {
   }
 };
 
-export const deleteMeeting = async (req: Request, res: Response) => {
+export const deleteMeeting = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    await deleteDoc(doc(db, MEETINGS_COLLECTION, id as string));
+    const meetingRef = doc(db, MEETINGS_COLLECTION, id as string);
+    const meetingSnap = await getDoc(meetingRef);
+    if (!meetingSnap.exists()) {
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+    const meeting = meetingSnap.data() as { hostId: string };
+    if (meeting.hostId !== req.authUser?.uid) {
+      return res.status(403).json({ error: 'Only host can delete meeting' });
+    }
+    await deleteDoc(meetingRef);
     res.json({ message: 'Meeting deleted' });
   } catch (error) {
     console.error('Delete meeting error:', error);
@@ -72,9 +96,12 @@ export const deleteMeeting = async (req: Request, res: Response) => {
   }
 };
 
-export const listUserMeetings = async (req: Request, res: Response) => {
+export const listUserMeetings = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { userId } = req.params;
+    const userId = req.authUser?.uid;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     const q = query(collection(db, MEETINGS_COLLECTION), where('hostId', '==', userId));
     const querySnapshot = await getDocs(q);
     
@@ -87,12 +114,12 @@ export const listUserMeetings = async (req: Request, res: Response) => {
 };
 
 /** Restart (reactivate) an ended meeting. Only the original host can restart. */
-export const restartMeeting = async (req: Request, res: Response) => {
+export const restartMeeting = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { userId } = req.body as { userId?: string };
+    const userId = req.authUser?.uid;
     if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
+      return res.status(401).json({ error: 'Unauthorized' });
     }
     const meetingRef = doc(db, MEETINGS_COLLECTION, id as string);
     const meetingSnap = await getDoc(meetingRef);

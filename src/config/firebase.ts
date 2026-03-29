@@ -1,26 +1,33 @@
-import { initializeApp } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
-import { getAuth, signInAnonymously } from "firebase/auth";
+import 'dotenv/config';
+import { initializeApp } from 'firebase/app';
+import { getFirestore } from 'firebase/firestore';
+import admin from 'firebase-admin';
 
 const firebaseConfig = {
-  apiKey: "AIzaSyDzXEFEPR5Qw6ZHUB7s7q_AS65P3qntQCM",
-  authDomain: "stream-6c5bb.firebaseapp.com",
-  projectId: "stream-6c5bb",
-  storageBucket: "stream-6c5bb.firebasestorage.app",
-  messagingSenderId: "934572124832",
-  appId: "1:934572124832:web:ff543b81acf179155c77c5",
-  measurementId: "G-MB0XJ68B98",
+  apiKey: "AIzaSyDkH3rGQ0UoH2a_fNFO7HaP2oOpazyH7rU",
+  authDomain: "fieldcom-8159b.firebaseapp.com",
+  projectId: "fieldcom-8159b",
+  storageBucket: "fieldcom-8159b.appspot.com",
+  messagingSenderId: "548978360911",
+  appId: "1:548978360911:web:0e05e3d0220d623edc203a",
+  measurementId: "G-MN9QG97XJE"
 };
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app);
-export const auth = getAuth(app);
+const clientApp = initializeApp(firebaseConfig);
+export const db = getFirestore(clientApp);
+
+const initAdmin = () => {
+  if (admin.apps.length > 0) {
+    return admin.app();
+  }
+  return admin.initializeApp({
+    projectId: firebaseConfig.projectId
+  });
+};
+
+const adminApp = initAdmin();
+export const adminAuth = admin.auth(adminApp);
 
 export const initFirebase = async () => {
-  try {
-    const userCredential = await signInAnonymously(auth);
-    console.log("Firebase: Signed in anonymously as", userCredential.user.uid);
-  } catch (error) {
-    console.error("Firebase: Error signing in anonymously", error);
-  }
+  console.log('Firebase Admin initialized in projectId mode');
 };
