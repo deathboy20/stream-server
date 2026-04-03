@@ -44,6 +44,59 @@ export const setupSocketEvents = (io: Server) => {
     queue.forEach(fn => { (fn as () => void)(); });
   };
 
+  const emitSessionParticipants = (sessionId: string, excludedSocketId?: string) => {
+    const participants = Array.from(io.sockets.adapter.rooms.get(sessionId) || [])
+      .filter(id => id !== excludedSocketId)
+      .map(id => {
+        const s = io.sockets.sockets.get(id);
+        return {
+          viewerId: id,
+          name: (s?.data?.displayName as string | undefined) || 'Guest',
+          isHost: !!s?.data?.isHost
+        };
+      });
+    io.to(sessionId).emit('session-participants', { sessionId, participants });
+  };
+
+  const persistParticipantRemoval = async (sessionId: string, viewerId: string) => {
+    try {
+      const mRef = doc(db, MEETINGS_COLLECTION, sessionId);
+      const mSnap = await getDoc(mRef);
+      if (mSnap.exists()) {
+        const d = mSnap.data() as any;
+        const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(d.participants) ? d.participants : [];
+        const updated = participants.filter(p => p.id !== viewerId);
+        await updateDoc(mRef, { participants: updated });
+      }
+    } catch (e) {
+      console.error('Failed to persist participant removal', e);
+    }
+  };
+
+  const removeParticipantFromSession = async (sessionId: string, viewerId: string) => {
+    const targetSocket = io.sockets.sockets.get(viewerId);
+
+    if (targetSocket) {
+      targetSocket.leave(sessionId);
+      if ((targetSocket.data.sessionId as string | undefined) === sessionId) {
+        delete targetSocket.data.sessionId;
+      }
+      if (targetSocket.data.isHost) {
+        targetSocket.data.isHost = false;
+      }
+      if (targetSocket.data.isCoHost) {
+        targetSocket.data.isCoHost = false;
+      }
+    }
+
+    const list = pendingRequests.get(sessionId) || [];
+    pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
+
+    io.to(sessionId).emit('viewer-left', { viewerId });
+    emitSessionParticipants(sessionId, viewerId);
+    await persistParticipantRemoval(sessionId, viewerId);
+  };
+
   io.use(async (socket, next) => {
     try {
       const tokenFromAuth = typeof socket.handshake.auth?.token === 'string'
@@ -182,13 +235,16 @@ export const setupSocketEvents = (io: Server) => {
       });
     });
 
-    socket.on('targeted-command', (data: { sessionId: string; targetId: string; command: string; value?: unknown }) => {
+    socket.on('targeted-command', async (data: { sessionId: string; targetId: string; command: string; value?: unknown }) => {
       if (!socket.data.isHost) return;
       io.to(data.targetId).emit('peer-command', {
         command: data.command,
         value: data.value,
         sender: socket.id
       });
+      if (data.command === 'remove') {
+        await removeParticipantFromSession(data.sessionId, data.targetId);
+      }
     });
 
     socket.on('join-user', (userId: string) => {
@@ -214,6 +270,22 @@ export const setupSocketEvents = (io: Server) => {
           };
         });
       io.to(data.sessionId).emit('session-participants', { sessionId: data.sessionId, participants });
+    });
+
+    socket.on('viewer-left', async (data: { sessionId?: string; viewerId?: string }) => {
+      const sessionId = data?.sessionId || (socket.data.sessionId as string | undefined);
+      if (!sessionId) return;
+      const viewerId = data?.viewerId || socket.id;
+      if (viewerId !== socket.id && !socket.data.isHost) return;
+      await removeParticipantFromSession(sessionId, viewerId);
+    });
+
+    socket.on('leave-session', async (data: { sessionId?: string } | string | undefined) => {
+      const sessionId = typeof data === 'string'
+        ? data
+        : (data?.sessionId || (socket.data.sessionId as string | undefined));
+      if (!sessionId) return;
+      await removeParticipantFromSession(sessionId, socket.id);
     });
 
     socket.on('get-session-participants', (data: { sessionId: string }) => {
@@ -408,35 +480,13 @@ export const setupSocketEvents = (io: Server) => {
       const sessionId = socket.data.sessionId as string | undefined;
       if (sessionId) {
         io.to(sessionId).emit('viewer-left', { viewerId: socket.id });
-        const participants = Array.from(io.sockets.adapter.rooms.get(sessionId) || [])
-          .filter(id => id !== socket.id)
-          .map(id => {
-            const s = io.sockets.sockets.get(id);
-            return {
-              viewerId: id,
-              name: (s?.data?.displayName as string | undefined) || 'Guest',
-              isHost: !!s?.data?.isHost
-            };
-          });
-        io.to(sessionId).emit('session-participants', { sessionId, participants });
+        emitSessionParticipants(sessionId, socket.id);
         if (socket.data.isHost) {
           io.to(sessionId).emit('host-left', { sessionId });
         }
-        pendingRequests.delete(sessionId);
-        (async () => {
-          try {
-            const mRef = doc(db, MEETINGS_COLLECTION, sessionId);
-            const mSnap = await getDoc(mRef);
-            if (mSnap.exists()) {
-              const d = mSnap.data() as any;
-              const participants: Array<{ id: string; name: string; role?: string }> = Array.isArray(d.participants) ? d.participants : [];
-              const updated = participants.filter(p => p.id !== socket.id);
-              await updateDoc(mRef, { participants: updated });
-            }
-          } catch (e) {
-            console.error('Failed to persist participant removal', e);
-          }
-        })();
+        const list = pendingRequests.get(sessionId) || [];
+        pendingRequests.set(sessionId, list.filter(r => r.viewerId !== socket.id));
+        persistParticipantRemoval(sessionId, socket.id);
       }
     });
   });
