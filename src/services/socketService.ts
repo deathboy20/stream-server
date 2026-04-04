@@ -14,10 +14,43 @@ interface PendingRequest {
 
 export const setupSocketEvents = (io: Server) => {
   const MEETINGS_COLLECTION = 'tele-meet';
+  const SESSIONS_COLLECTION = 'sessions';
   const sessionHosts = new Map<string, string>();
   const meetingCache = new Map<string, MeetingMeta>();
   const pendingRequests = new Map<string, PendingRequest[]>();
   const socketQueue = new Map<string, unknown[]>();
+  const sessionActivity = new Map<string, number>();
+  const socketRateBuckets = new Map<string, { count: number; resetAt: number }>();
+
+  const touchSession = (sessionId: string) => {
+    sessionActivity.set(sessionId, Date.now());
+  };
+
+  const maybeCleanupSessionCaches = (sessionId: string) => {
+    const roomSize = io.sockets.adapter.rooms.get(sessionId)?.size || 0;
+    if (roomSize > 0) return;
+    sessionHosts.delete(sessionId);
+    meetingCache.delete(sessionId);
+    pendingRequests.delete(sessionId);
+    socketQueue.delete(sessionId);
+    sessionActivity.delete(sessionId);
+  };
+
+  const checkSocketRateLimit = (socketId: string, eventName: string, maxRequests: number, windowMs: number) => {
+    const key = `${socketId}:${eventName}`;
+    const now = Date.now();
+    const bucket = socketRateBuckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+      socketRateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      return true;
+    }
+    if (bucket.count >= maxRequests) {
+      return false;
+    }
+    bucket.count += 1;
+    socketRateBuckets.set(key, bucket);
+    return true;
+  };
 
   const getMeetingMeta = async (sessionId: string): Promise<MeetingMeta | null> => {
     if (meetingCache.has(sessionId)) {
@@ -58,6 +91,19 @@ export const setupSocketEvents = (io: Server) => {
     io.to(sessionId).emit('session-participants', { sessionId, participants });
   };
 
+  const validateViewerJoinToken = async (sessionId: string, viewerId: string, joinToken: string) => {
+    try {
+      const sessionSnap = await getDoc(doc(db, SESSIONS_COLLECTION, sessionId));
+      if (!sessionSnap.exists()) return null;
+      const data = sessionSnap.data() as { viewers?: Record<string, { joinToken?: string; name?: string }> };
+      const viewer = data.viewers?.[viewerId];
+      if (!viewer || !viewer.joinToken || viewer.joinToken !== joinToken) return null;
+      return viewer.name || 'Guest';
+    } catch {
+      return null;
+    }
+  };
+
   const persistParticipantRemoval = async (sessionId: string, viewerId: string) => {
     try {
       const mRef = doc(db, MEETINGS_COLLECTION, sessionId);
@@ -95,6 +141,7 @@ export const setupSocketEvents = (io: Server) => {
     io.to(sessionId).emit('viewer-left', { viewerId });
     emitSessionParticipants(sessionId, viewerId);
     await persistParticipantRemoval(sessionId, viewerId);
+    maybeCleanupSessionCaches(sessionId);
   };
 
   io.use(async (socket, next) => {
@@ -117,6 +164,25 @@ export const setupSocketEvents = (io: Server) => {
       next(new Error('Unauthorized socket connection'));
     }
   });
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [sessionId, lastSeenAt] of sessionActivity.entries()) {
+      const inactiveForMs = now - lastSeenAt;
+      if (inactiveForMs > 60 * 60 * 1000) {
+        sessionHosts.delete(sessionId);
+        meetingCache.delete(sessionId);
+        pendingRequests.delete(sessionId);
+        socketQueue.delete(sessionId);
+        sessionActivity.delete(sessionId);
+      }
+    }
+    for (const [key, bucket] of socketRateBuckets.entries()) {
+      if (bucket.resetAt <= now) {
+        socketRateBuckets.delete(key);
+      }
+    }
+  }, 10 * 60 * 1000);
 
   io.on('connection', (socket: Socket) => {
     console.log('User connected:', socket.id);
@@ -143,6 +209,7 @@ export const setupSocketEvents = (io: Server) => {
 
       socket.join(sessionId);
       socket.data.sessionId = sessionId;
+      touchSession(sessionId);
       if (userId) {
         socket.data.userId = userId;
       }
@@ -167,21 +234,28 @@ export const setupSocketEvents = (io: Server) => {
       setTimeout(() => flushQueue(sessionId), 0);
     });
 
-    socket.on('join-request', async (data: { sessionId: string; viewerId: string; name: string }) => {
-      const { sessionId, viewerId, name } = data;
+    socket.on('join-request', async (data: { sessionId: string; name: string }) => {
+      if (!checkSocketRateLimit(socket.id, 'join-request', 8, 60_000)) {
+        socket.emit('join-error', { error: 'Too many join requests. Please wait and try again.' });
+        return;
+      }
+      const { sessionId, name } = data;
+      const viewerId = socket.id;
+      const safeName = typeof name === 'string' && name.trim().length > 0 ? name.trim().slice(0, 80) : 'Guest';
 
       const meta = await getMeetingMeta(sessionId);
       if (!meta || !meta.isActive) {
-        io.to(viewerId).emit('join-rejected', { sessionId, reason: 'Meeting has ended' });
+        io.to(socket.id).emit('join-rejected', { sessionId, reason: 'Meeting has ended' });
         return;
       }
 
       const list = pendingRequests.get(sessionId) || [];
       if (!list.find(r => r.viewerId === viewerId)) {
-        list.push({ viewerId, name });
+        list.push({ viewerId, name: safeName });
         pendingRequests.set(sessionId, list);
       }
-      io.to(sessionId).emit('pending-join', { viewerId, name });
+      touchSession(sessionId);
+      io.to(sessionId).emit('pending-join', { viewerId, name: safeName });
     });
 
     socket.on('approve-join', (data: { sessionId: string; viewerId: string }) => {
@@ -193,6 +267,7 @@ export const setupSocketEvents = (io: Server) => {
       const list = pendingRequests.get(sessionId) || [];
       const entry = list.find(r => r.viewerId === viewerId) || { viewerId, name: 'Guest' };
       pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
+      touchSession(sessionId);
 
       io.to(viewerId).emit('join-approved', { sessionId });
       io.to(sessionId).emit('viewer-connected', { viewerId, name: entry.name, isHost: false });
@@ -222,6 +297,7 @@ export const setupSocketEvents = (io: Server) => {
       const { sessionId, viewerId } = data;
       const list = pendingRequests.get(sessionId) || [];
       pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
+      touchSession(sessionId);
       io.to(viewerId).emit('join-rejected', { sessionId });
       io.to(sessionId).emit('pending-requests-updated', { viewerId });
     });
@@ -247,8 +323,26 @@ export const setupSocketEvents = (io: Server) => {
       }
     });
 
-    socket.on('join-user', (userId: string) => {
-      socket.join(userId);
+    socket.on('join-user', async (data: { sessionId: string; viewerId: string; joinToken: string }) => {
+      const sessionId = data?.sessionId;
+      const viewerId = data?.viewerId;
+      const joinToken = data?.joinToken;
+      if (!sessionId || !viewerId || !joinToken) {
+        socket.emit('join-error', { error: 'Invalid viewer join payload' });
+        return;
+      }
+      if (!checkSocketRateLimit(socket.id, 'join-user', 20, 60_000)) {
+        socket.emit('join-error', { error: 'Too many join attempts. Please wait and retry.' });
+        return;
+      }
+      const viewerName = await validateViewerJoinToken(sessionId, viewerId, joinToken);
+      if (!viewerName) {
+        socket.emit('join-error', { error: 'Unauthorized viewer access' });
+        return;
+      }
+      touchSession(sessionId);
+      socket.data.displayName = viewerName;
+      socket.join(viewerId);
     });
 
     socket.on('viewer-connected', (data: { sessionId: string; viewerId: string; name?: string }) => {
@@ -305,8 +399,14 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('viewer-ready', (data: { sessionId: string; viewerId: string }) => {
-      console.log(`Viewer ${data.viewerId} ready for WebRTC in session ${data.sessionId}`);
-      socket.to(data.sessionId).emit('viewer-ready', { viewerId: data.viewerId });
+      if (!checkSocketRateLimit(socket.id, 'viewer-ready', 60, 60_000)) {
+        return;
+      }
+      const sessionId = data?.sessionId || (socket.data.sessionId as string | undefined);
+      if (!sessionId) return;
+      touchSession(sessionId);
+      console.log(`Viewer ${socket.id} ready for WebRTC in session ${sessionId}`);
+      socket.to(sessionId).emit('viewer-ready', { viewerId: data?.viewerId || socket.id });
     });
 
     socket.on('viewer-watching', (data: { sessionId: string; viewerId: string }) => {
@@ -315,6 +415,17 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('signal', (data: { target: string; signal: unknown; sessionId: string; metadata?: unknown }) => {
+      if (!checkSocketRateLimit(socket.id, 'signal', 600, 60_000)) {
+        socket.emit('join-error', { error: 'Signaling rate limit exceeded' });
+        return;
+      }
+      if (!data?.target || !data?.sessionId || !data?.signal) return;
+      if (!socket.rooms.has(data.sessionId)) return;
+      const targetSocket = io.sockets.sockets.get(data.target);
+      if (!targetSocket || !targetSocket.rooms.has(data.sessionId) && data.target !== data.sessionId) {
+        return;
+      }
+      touchSession(data.sessionId);
       io.to(data.target).emit('signal', {
         signal: data.signal,
         sender: socket.id,
@@ -323,6 +434,9 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('chat-message', (data: { sessionId: string; message: string; senderName: string; senderId: string; timestamp: number }) => {
+      if (!checkSocketRateLimit(socket.id, 'chat-message', 40, 60_000)) return;
+      if (!data?.sessionId || typeof data.message !== 'string') return;
+      touchSession(data.sessionId);
       io.to(data.sessionId).emit('chat-message', data);
     });
 
@@ -412,6 +526,9 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('reaction', (data: { sessionId: string; reaction: string; senderName: string; senderId: string }) => {
+      if (!checkSocketRateLimit(socket.id, 'reaction', 80, 60_000)) return;
+      if (!data?.sessionId) return;
+      touchSession(data.sessionId);
       io.to(data.sessionId).emit('reaction', data);
     });
 
@@ -477,6 +594,11 @@ export const setupSocketEvents = (io: Server) => {
 
     socket.on('disconnect', () => {
       console.log('User disconnected:', socket.id);
+      for (const key of socketRateBuckets.keys()) {
+        if (key.startsWith(`${socket.id}:`)) {
+          socketRateBuckets.delete(key);
+        }
+      }
       const sessionId = socket.data.sessionId as string | undefined;
       if (sessionId) {
         io.to(sessionId).emit('viewer-left', { viewerId: socket.id });
@@ -487,6 +609,7 @@ export const setupSocketEvents = (io: Server) => {
         const list = pendingRequests.get(sessionId) || [];
         pendingRequests.set(sessionId, list.filter(r => r.viewerId !== socket.id));
         persistParticipantRemoval(sessionId, socket.id);
+        maybeCleanupSessionCaches(sessionId);
       }
     });
   });

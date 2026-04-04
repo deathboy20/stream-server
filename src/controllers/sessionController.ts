@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { Session, Viewer } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../config/firebase';
-import { collection, doc, setDoc, getDoc, deleteDoc, updateDoc, getDocs } from 'firebase/firestore';
+import { doc, setDoc, getDoc, deleteDoc, updateDoc } from 'firebase/firestore';
 import { AuthenticatedRequest } from '../middleware/auth';
 
 const SESSIONS_COLLECTION = 'sessions';
@@ -87,7 +87,13 @@ export const getViewers = async (req: Request, res: Response) => {
 
     if (sessionSnap.exists()) {
       const data = sessionSnap.data() as Session;
-      res.json(data.viewers || {});
+      const sanitizedViewers = Object.entries(data.viewers || {}).reduce<Record<string, Omit<Viewer, 'joinToken'>>>((acc, [viewerId, viewer]) => {
+        const { joinToken, ...safeViewer } = viewer as Viewer;
+        void joinToken;
+        acc[viewerId] = safeViewer;
+        return acc;
+      }, {});
+      res.json(sanitizedViewers);
     } else {
       res.status(404).json({ error: 'Session not found' });
     }
@@ -115,11 +121,13 @@ export const requestJoin = async (req: Request, res: Response) => {
     const admissionMode = sessionData.admissionMode || 'manual';
 
     const viewerId = uuidv4();
+    const joinToken = uuidv4();
     const viewer: Viewer = {
       id: viewerId,
       name,
       joinedAt: Date.now(),
-      status: admissionMode === 'auto' ? 'approved' : 'waiting'
+      status: admissionMode === 'auto' ? 'approved' : 'waiting',
+      joinToken
     };
 
     // Update using dot notation to target specific map key

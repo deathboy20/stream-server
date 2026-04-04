@@ -3,6 +3,7 @@ export interface Viewer {
   name: string;
   joinedAt: number;
   status: 'waiting' | 'approved' | 'rejected';
+  joinToken?: string;
 }
 
 export interface Session {

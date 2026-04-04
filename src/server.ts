@@ -7,6 +7,7 @@ import meetingRoutes from './routes/meetingRoutes';
 import { startCleanupJob } from './services/cleanupService';
 import { setupSocketEvents } from './services/socketService';
 import { initFirebase } from './config/firebase';
+import { createRateLimiter } from './middleware/rateLimit';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -54,12 +55,13 @@ app.set('trust proxy', 1);
 app.use(cors(corsOptions));
 app.options('/{*splat}', cors(corsOptions));
 app.use(express.json());
+app.use('/api', createRateLimiter({ windowMs: 60_000, maxRequests: 180 }));
 
 // Initialize Socket.IO events
 setupSocketEvents(io);
 
 // Health Check
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (_req, res) => {
   res.json({
     status: 'backend server running',
     endpoints: [

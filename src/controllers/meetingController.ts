@@ -53,6 +53,35 @@ export const getMeeting = async (req: Request, res: Response) => {
   }
 };
 
+export const getMeetingPublic = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const meetingSnap = await getDoc(doc(db, MEETINGS_COLLECTION, id as string));
+    if (!meetingSnap.exists()) {
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+    const data = meetingSnap.data() as {
+      id: string;
+      title?: string;
+      hostName?: string;
+      isActive?: boolean;
+      createdAt?: number;
+      scheduledAt?: number;
+    };
+    res.json({
+      id: data.id || id,
+      title: data.title || 'Meeting',
+      hostName: data.hostName || 'Host',
+      isActive: data.isActive !== false,
+      createdAt: data.createdAt || null,
+      scheduledAt: data.scheduledAt || null
+    });
+  } catch (error) {
+    console.error('Get public meeting error:', error);
+    res.status(500).json({ error: 'Failed to get meeting' });
+  }
+};
+
 export const updateMeeting = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
