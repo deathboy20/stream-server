@@ -5,6 +5,7 @@ import { doc, getDoc, updateDoc } from 'firebase/firestore';
 interface MeetingMeta {
   hostId: string;
   isActive: boolean;
+  fetchedAt: number;
 }
 
 interface PendingRequest {
@@ -53,8 +54,9 @@ export const setupSocketEvents = (io: Server) => {
   };
 
   const getMeetingMeta = async (sessionId: string): Promise<MeetingMeta | null> => {
-    if (meetingCache.has(sessionId)) {
-      return meetingCache.get(sessionId)!;
+    const cached = meetingCache.get(sessionId);
+    if (cached && cached.isActive) {
+      return cached;
     }
     try {
       const snap = await getDoc(doc(db, MEETINGS_COLLECTION, sessionId));
@@ -62,7 +64,8 @@ export const setupSocketEvents = (io: Server) => {
       const data = snap.data();
       const meta: MeetingMeta = {
         hostId: data.hostId,
-        isActive: data.isActive !== false
+        isActive: data.isActive !== false,
+        fetchedAt: Date.now()
       };
       meetingCache.set(sessionId, meta);
       return meta;
@@ -187,9 +190,10 @@ export const setupSocketEvents = (io: Server) => {
   io.on('connection', (socket: Socket) => {
     console.log('User connected:', socket.id);
 
-    socket.on('join-session', async (data: { sessionId: string; userId?: string } | string) => {
+    socket.on('join-session', async (data: { sessionId: string; userId?: string; name?: string } | string) => {
       const sessionId = typeof data === 'string' ? data : data.sessionId;
       const userId = typeof data === 'string' ? null : data.userId;
+      const name = typeof data === 'string' ? undefined : data.name;
 
       if (userId) {
         const firebaseUid = socket.data.firebaseUid as string | undefined;
@@ -212,6 +216,9 @@ export const setupSocketEvents = (io: Server) => {
       touchSession(sessionId);
       if (userId) {
         socket.data.userId = userId;
+      }
+      if (typeof name === 'string' && name.trim()) {
+        socket.data.displayName = name.trim().slice(0, 80);
       }
 
       const participants = Array.from(io.sockets.adapter.rooms.get(sessionId) || [])
@@ -242,6 +249,7 @@ export const setupSocketEvents = (io: Server) => {
       const { sessionId, name } = data;
       const viewerId = socket.id;
       const safeName = typeof name === 'string' && name.trim().length > 0 ? name.trim().slice(0, 80) : 'Guest';
+      socket.data.displayName = safeName;
 
       const meta = await getMeetingMeta(sessionId);
       if (!meta || !meta.isActive) {
@@ -269,8 +277,7 @@ export const setupSocketEvents = (io: Server) => {
       pendingRequests.set(sessionId, list.filter(r => r.viewerId !== viewerId));
       touchSession(sessionId);
 
-      io.to(viewerId).emit('join-approved', { sessionId });
-      io.to(sessionId).emit('viewer-connected', { viewerId, name: entry.name, isHost: false });
+      io.to(viewerId).emit('join-approved', { sessionId, approvedName: entry.name });
       io.to(sessionId).emit('pending-requests-updated', { viewerId });
 
       (async () => {
@@ -346,11 +353,14 @@ export const setupSocketEvents = (io: Server) => {
     });
 
     socket.on('viewer-connected', (data: { sessionId: string; viewerId: string; name?: string }) => {
-      socket.data.displayName = data.name || socket.data.displayName || 'Guest';
+      const safeName = typeof data.name === 'string' && data.name.trim().length > 0
+        ? data.name.trim().slice(0, 80)
+        : ((socket.data.displayName as string | undefined) || 'Guest');
+      socket.data.displayName = safeName;
       console.log(`Viewer ${data.viewerId} connected to session ${data.sessionId}`);
       socket.to(data.sessionId).emit('viewer-connected', {
         viewerId: data.viewerId,
-        name: data.name,
+        name: safeName,
         isHost: !!socket.data.isHost
       });
       const participants = Array.from(io.sockets.adapter.rooms.get(data.sessionId) || [])
@@ -453,7 +463,7 @@ export const setupSocketEvents = (io: Server) => {
       io.to(data.sessionId).emit('meeting-ended', { sessionId: data.sessionId });
       const cached = meetingCache.get(data.sessionId);
       if (cached) {
-        meetingCache.set(data.sessionId, { ...cached, isActive: false });
+        meetingCache.set(data.sessionId, { ...cached, isActive: false, fetchedAt: Date.now() });
       }
       pendingRequests.delete(data.sessionId);
       const socketsInRoom = Array.from(io.sockets.adapter.rooms.get(data.sessionId) || []);
@@ -575,7 +585,10 @@ export const setupSocketEvents = (io: Server) => {
 
         await updateDoc(mRef, { hostId: newHostUserId, hostName: newHostName });
         sessionHosts.set(sessionId, newHostUserId);
-        meetingCache.set(sessionId, { ...meetingCache.get(sessionId)!, hostId: newHostUserId });
+        const existingMeta = meetingCache.get(sessionId);
+        if (existingMeta) {
+          meetingCache.set(sessionId, { ...existingMeta, hostId: newHostUserId, fetchedAt: Date.now() });
+        }
 
         socket.data.isHost = false;
         targetSocket.data.isHost = true;
